@@ -1,0 +1,711 @@
+# -*- coding: utf-8 -*-
+# Full analysis code for:
+# - Dissipative vs Reversible continuous-time 2nd-order RNN (q,p) with double-well potential
+# - Attractor memory, sequence tracking, nonlinear input-output mapping
+# - ESN and Leaky RNN baselines
+# - Bootstrap CIs, statistical tests, Holm–Bonferroni
+# - Internal dynamics: trial-to-trial variance and autocorrelation decay time
+# - Figures 1–3
+#
+# Dependencies: numpy, scipy, matplotlib
+
+import numpy as np
+import math
+from dataclasses import dataclass
+from typing import Dict, Tuple, List, Optional
+import matplotlib.pyplot as plt
+
+from scipy import stats
+
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def set_seed(seed: int):
+    np.random.seed(seed)
+
+def bootstrap_ci(x: np.ndarray, n_boot: int = 20000, alpha: float = 0.05, seed: int = 0) -> Tuple[float, float]:
+    """
+    Nonparametric bootstrap CI for the mean of x.
+    Returns (lower, upper).
+    """
+    rng = np.random.default_rng(seed)
+    x = np.asarray(x)
+    n = len(x)
+    idx = rng.integers(0, n, size=(n_boot, n))
+    means = x[idx].mean(axis=1)
+    lo = np.quantile(means, alpha / 2.0)
+    hi = np.quantile(means, 1.0 - alpha / 2.0)
+    return float(lo), float(hi)
+
+def cohens_d(x: np.ndarray, y: np.ndarray) -> float:
+    """
+    Cohen's d for two independent samples (pooled SD).
+    """
+    x = np.asarray(x); y = np.asarray(y)
+    nx, ny = len(x), len(y)
+    vx, vy = x.var(ddof=1), y.var(ddof=1)
+    sp = math.sqrt(((nx - 1) * vx + (ny - 1) * vy) / (nx + ny - 2))
+    if sp == 0:
+        return 0.0
+    return float((x.mean() - y.mean()) / sp)
+
+def welch_ttest(x: np.ndarray, y: np.ndarray) -> float:
+    """
+    Two-sided Welch's t-test p-value.
+    """
+    return float(stats.ttest_ind(x, y, equal_var=False).pvalue)
+
+def fisher_exact_from_binary(acc_a: np.ndarray, acc_b: np.ndarray) -> float:
+    """
+    Fisher's exact test on counts of successes/failures.
+    acc_* are binary arrays (0/1 per trial).
+    """
+    a_succ = int(acc_a.sum()); a_fail = int(len(acc_a) - a_succ)
+    b_succ = int(acc_b.sum()); b_fail = int(len(acc_b) - b_succ)
+    table = np.array([[a_succ, a_fail],
+                      [b_succ, b_fail]], dtype=int)
+    return float(stats.fisher_exact(table, alternative='two-sided')[1])
+
+def holm_bonferroni(pvals: List[float]) -> List[float]:
+    """
+    Holm–Bonferroni adjusted p-values.
+    """
+    m = len(pvals)
+    order = np.argsort(pvals)
+    adj = np.empty(m, dtype=float)
+    prev = 0.0
+    for k, i in enumerate(order):
+        adj_i = (m - k) * pvals[i]
+        adj_i = min(1.0, adj_i)
+        prev = max(prev, adj_i)
+        adj[i] = prev
+    return adj.tolist()
+
+# -----------------------------
+# Model definitions
+# -----------------------------
+
+@dataclass
+class CT2RNNParams:
+    N: int = 50
+    a: float = 1.0
+    b: float = 1.0
+    g: float = 0.9
+    gamma_q: float = 0.2
+    gamma_p: float = 0.2
+    dt: float = 0.01
+
+def grad_U(q: np.ndarray, a: float, b: float) -> np.ndarray:
+    # grad_U(q)_i = a*q_i^3 - b*q_i
+    return a * (q ** 3) - b * q
+
+def euler_step_qp(q: np.ndarray, p: np.ndarray, W: np.ndarray, I: np.ndarray,
+                  params: CT2RNNParams, sigma: float, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    One Euler step of:
+      dq/dt = p - gamma_q * q
+      dp/dt = - grad_U(q) - W q - gamma_p p + I
+    plus ongoing noise injected into q:
+      q <- q + sigma * sqrt(dt) * Normal(0,1)
+    """
+    dq = p - params.gamma_q * q
+    dp = -grad_U(q, params.a, params.b) - (W @ q) - params.gamma_p * p + I
+
+    q_new = q + params.dt * dq
+    p_new = p + params.dt * dp
+
+    if sigma > 0:
+        q_new = q_new + sigma * math.sqrt(params.dt) * rng.normal(0.0, 1.0, size=q.shape)
+
+    return q_new, p_new
+
+def simulate_ct2rnn(W: np.ndarray, I_of_t, T: float, params: CT2RNNParams,
+                    q0: np.ndarray, p0: Optional[np.ndarray] = None,
+                    sigma_ongoing: float = 0.0, seed: int = 0,
+                    record: bool = False) -> Dict[str, np.ndarray]:
+    """
+    Simulate with Euler for duration T.
+    I_of_t: callable t -> I(t) (shape N,)
+    Returns final states and optionally trajectory of r(t)=tanh(q).
+    """
+    rng = np.random.default_rng(seed)
+    steps = int(round(T / params.dt))
+    q = q0.copy()
+    p = np.zeros_like(q) if p0 is None else p0.copy()
+
+    if record:
+        r_traj = np.zeros((steps + 1, params.N), dtype=float)
+        r_traj[0] = np.tanh(q)
+
+    t = 0.0
+    for s in range(steps):
+        I = I_of_t(t)
+        q, p = euler_step_qp(q, p, W, I, params, sigma_ongoing, rng)
+        t += params.dt
+        if record:
+            r_traj[s + 1] = np.tanh(q)
+
+    out = {"qT": q, "pT": p}
+    if record:
+        out["r_traj"] = r_traj
+    return out
+
+# -----------------------------
+# Connectivity builders
+# -----------------------------
+
+def build_hopfield_W(patterns: np.ndarray) -> np.ndarray:
+    """
+    patterns: shape (P, N), elements in {-1,+1}
+    W = (1/N) sum_mu xi_mu xi_mu^T, diag=0
+    """
+    P, N = patterns.shape
+    W = np.zeros((N, N), dtype=float)
+    for mu in range(P):
+        x = patterns[mu]
+        W += np.outer(x, x)
+    W /= N
+    np.fill_diagonal(W, 0.0)
+    return W
+
+def build_reservoir_W(N: int, g: float, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    W = rng.normal(0.0, g / math.sqrt(N), size=(N, N))
+    np.fill_diagonal(W, 0.0)
+    return W
+
+def build_input_B(N: int, d_in: int, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.normal(0.0, 1.0, size=(N, d_in))
+
+# -----------------------------
+# Tasks
+# -----------------------------
+
+def overlap_to_patterns(rT: np.ndarray, patterns: np.ndarray) -> np.ndarray:
+    """
+    overlap(mu) = mean( sign(xi_mu) * rT )
+    Here xi are ±1 already; sign(xi)=xi.
+    """
+    return (patterns @ rT) / patterns.shape[1]
+
+def attractor_memory_trial(patterns: np.ndarray, W: np.ndarray, params: CT2RNNParams,
+                           cue_mu: int, noise_std_init: float, seed: int,
+                           T: float = 15.0) -> int:
+    """
+    q(0) = xi(cue) + N(0, noise_std)
+    I(t)=0, ongoing noise = 0
+    return 1 if retrieved correct, else 0
+    """
+    rng = np.random.default_rng(seed)
+    q0 = patterns[cue_mu].astype(float) + rng.normal(0.0, noise_std_init, size=params.N)
+    def I_of_t(t):
+        return np.zeros(params.N, dtype=float)
+    out = simulate_ct2rnn(W, I_of_t, T=T, params=params, q0=q0, sigma_ongoing=0.0, seed=seed, record=False)
+    rT = np.tanh(out["qT"])
+    ov = overlap_to_patterns(rT, patterns)
+    mu_hat = int(np.argmax(ov))
+    return 1 if mu_hat == cue_mu else 0
+
+def sequence_tracking_trial(patterns: np.ndarray, W: np.ndarray, params: CT2RNNParams,
+                            noise_std_ongoing: float, seed: int,
+                            T_total: float = 18.0, segment_T: float = 6.0, drive_amp: float = 0.8) -> float:
+    """
+    3 segments: mu=0,1,2 each for 6s. I(t)=0.8*xi_mu
+    Ongoing noise injected into q.
+    Accuracy = fraction of timepoints where argmax overlap matches target mu.
+    """
+    steps = int(round(T_total / params.dt))
+    seg_steps = int(round(segment_T / params.dt))
+
+    def I_of_t(t):
+        s = int(t / params.dt)
+        seg = min(2, s // seg_steps)
+        return drive_amp * patterns[seg].astype(float)
+
+    q0 = patterns[0].astype(float).copy()
+    out = simulate_ct2rnn(W, I_of_t, T=T_total, params=params, q0=q0, sigma_ongoing=noise_std_ongoing, seed=seed, record=True)
+    r_traj = out["r_traj"]  # (steps+1, N)
+
+    correct = 0
+    total = r_traj.shape[0]
+    for s in range(total):
+        seg = min(2, s // seg_steps)
+        ov = overlap_to_patterns(r_traj[s], patterns)
+        mu_hat = int(np.argmax(ov))
+        if mu_hat == seg:
+            correct += 1
+    return correct / total
+
+# Ridge regression for readout
+def ridge_fit(R: np.ndarray, y: np.ndarray, lam: float = 1e-3) -> np.ndarray:
+    """
+    R: (K, N) activations
+    y: (K,) targets
+    Returns C: (N,) weights for y_hat = R @ C
+    """
+    K, N = R.shape
+    A = R.T @ R + lam * np.eye(N)
+    b = R.T @ y
+    C = np.linalg.solve(A, b)
+    return C
+
+def input_output_generate_points(n_train: int, n_test: int, seed: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Generate fixed train/test points in [-1,1]^2.
+    """
+    rng = np.random.default_rng(seed)
+    X_train = rng.uniform(-1.0, 1.0, size=(n_train, 2))
+    X_test  = rng.uniform(-1.0, 1.0, size=(n_test, 2))
+    return X_train, X_test
+
+def target_f(X: np.ndarray) -> np.ndarray:
+    # f(x)=sin(pi*x1)*cos(pi*x2)
+    return np.sin(np.pi * X[:, 0]) * np.cos(np.pi * X[:, 1])
+
+def input_output_train_readout_ct2rnn(W: np.ndarray, B: np.ndarray, params: CT2RNNParams,
+                                      X_train: np.ndarray, T: float, lam: float,
+                                      seed_base: int = 0) -> np.ndarray:
+    """
+    Training done in dissipative regime without noise.
+    Record r(T)=tanh(q(T)) for each input, fit ridge readout.
+    """
+    K = X_train.shape[0]
+    R = np.zeros((K, params.N), dtype=float)
+    y = target_f(X_train)
+
+    for k in range(K):
+        x = X_train[k]
+        def I_of_t(t, x=x):
+            return B @ x
+        q0 = np.zeros(params.N, dtype=float)
+        out = simulate_ct2rnn(W, I_of_t, T=T, params=params, q0=q0, sigma_ongoing=0.0, seed=seed_base + k, record=False)
+        R[k] = np.tanh(out["qT"])
+
+    C = ridge_fit(R, y, lam=lam)
+    return C
+
+def input_output_eval_trial_ct2rnn(W: np.ndarray, B: np.ndarray, C: np.ndarray, params: CT2RNNParams,
+                                  X_test: np.ndarray, T: float, noise_std_ongoing: float,
+                                  seed: int) -> float:
+    """
+    Evaluate MSE over test set for one trial (new noise realization per input).
+    """
+    rng = np.random.default_rng(seed)
+    y_true = target_f(X_test)
+    y_hat = np.zeros_like(y_true)
+
+    for i in range(X_test.shape[0]):
+        x = X_test[i]
+        def I_of_t(t, x=x):
+            return B @ x
+        q0 = np.zeros(params.N, dtype=float)
+        out = simulate_ct2rnn(W, I_of_t, T=T, params=params, q0=q0,
+                             sigma_ongoing=noise_std_ongoing,
+                             seed=int(rng.integers(0, 2**31-1)),
+                             record=False)
+        rT = np.tanh(out["qT"])
+        y_hat[i] = rT @ C
+
+    mse = float(np.mean((y_hat - y_true) ** 2))
+    return mse
+
+# -----------------------------
+# ESN baseline
+# -----------------------------
+
+def esn_step(x_state: np.ndarray, u: float, W: np.ndarray, Win: np.ndarray) -> np.ndarray:
+    return np.tanh(W @ x_state + Win[:, 0] * u)
+
+def esn_train_readout(W: np.ndarray, Win: np.ndarray, u_series: np.ndarray, y_series: np.ndarray,
+                      washout: int, lam: float = 1e-3) -> np.ndarray:
+    """
+    Train linear readout on states after washout: y_hat = X @ C
+    """
+    N = W.shape[0]
+    x = np.zeros(N, dtype=float)
+    states = []
+    targets = []
+    for t in range(len(u_series)):
+        x = esn_step(x, u_series[t], W, Win)
+        if t >= washout:
+            states.append(x.copy())
+            targets.append(y_series[t])
+    X = np.asarray(states)
+    y = np.asarray(targets)
+    C = ridge_fit(X, y, lam=lam)
+    return C
+
+def esn_eval_mse(W: np.ndarray, Win: np.ndarray, C: np.ndarray,
+                 u_series: np.ndarray, y_series: np.ndarray, washout: int) -> float:
+    N = W.shape[0]
+    x = np.zeros(N, dtype=float)
+    preds = []
+    trues = []
+    for t in range(len(u_series)):
+        x = esn_step(x, u_series[t], W, Win)
+        if t >= washout:
+            preds.append(x @ C)
+            trues.append(y_series[t])
+    preds = np.asarray(preds)
+    trues = np.asarray(trues)
+    return float(np.mean((preds - trues) ** 2))
+
+# -----------------------------
+# Leaky RNN baseline (discrete-time)
+# -----------------------------
+
+def leaky_step(x_state: np.ndarray, u: float, W: np.ndarray, Win: np.ndarray, leak: float) -> np.ndarray:
+    pre = np.tanh(W @ x_state + Win[:, 0] * u)
+    return (1.0 - leak) * x_state + leak * pre
+
+def leaky_train_readout(W: np.ndarray, Win: np.ndarray, u_series: np.ndarray, y_series: np.ndarray,
+                        washout: int, leak: float, lam: float = 1e-3) -> np.ndarray:
+    N = W.shape[0]
+    x = np.zeros(N, dtype=float)
+    states = []
+    targets = []
+    for t in range(len(u_series)):
+        x = leaky_step(x, u_series[t], W, Win, leak)
+        if t >= washout:
+            states.append(x.copy())
+            targets.append(y_series[t])
+    X = np.asarray(states)
+    y = np.asarray(targets)
+    C = ridge_fit(X, y, lam=lam)
+    return C
+
+def leaky_eval_mse(W: np.ndarray, Win: np.ndarray, C: np.ndarray,
+                   u_series: np.ndarray, y_series: np.ndarray, washout: int, leak: float) -> float:
+    N = W.shape[0]
+    x = np.zeros(N, dtype=float)
+    preds = []
+    trues = []
+    for t in range(len(u_series)):
+        x = leaky_step(x, u_series[t], W, Win, leak)
+        if t >= washout:
+            preds.append(x @ C)
+            trues.append(y_series[t])
+    preds = np.asarray(preds)
+    trues = np.asarray(trues)
+    return float(np.mean((preds - trues) ** 2))
+
+# -----------------------------
+# Internal dynamics metrics (for CT2RNN input-output condition)
+# -----------------------------
+
+def trial_to_trial_variance(r_trials: np.ndarray) -> float:
+    """
+    r_trials: shape (n_trials, T_steps, N)
+    Compute variance across trials at each (t, unit), then average over time and units.
+    """
+    var = np.var(r_trials, axis=0, ddof=0)  # (T_steps, N)
+    return float(var.mean())
+
+def mean_autocorr_1e_time(r_trials: np.ndarray, dt: float) -> Tuple[np.ndarray, float]:
+    """
+    r_trials: (n_trials, T_steps, N)
+    Procedure:
+      - average over trials -> r_mean(t,unit)
+      - compute autocorr for each unit (normalized) over lags
+      - average autocorr over units
+      - tau = first lag where mean autocorr < 1/e
+    Returns (mean_ac, tau_sec)
+    """
+    r_mean = r_trials.mean(axis=0)  # (T_steps, N)
+    T_steps, N = r_mean.shape
+    max_lag = T_steps - 1
+
+    ac_units = np.zeros((N, max_lag + 1), dtype=float)
+    for j in range(N):
+        x = r_mean[:, j]
+        x = x - x.mean()
+        denom = np.dot(x, x)
+        if denom <= 1e-12:
+            ac_units[j, :] = 0.0
+            ac_units[j, 0] = 1.0
+            continue
+        for lag in range(max_lag + 1):
+            ac_units[j, lag] = np.dot(x[:T_steps - lag], x[lag:]) / denom
+
+    mean_ac = ac_units.mean(axis=0)
+    thresh = 1.0 / math.e
+    tau_idx = None
+    for lag in range(len(mean_ac)):
+        if mean_ac[lag] < thresh:
+            tau_idx = lag
+            break
+    if tau_idx is None:
+        tau_idx = len(mean_ac) - 1
+    tau_sec = float(tau_idx * dt)
+    return mean_ac, tau_sec
+
+# -----------------------------
+# Main analysis driver
+# -----------------------------
+
+def main():
+    # Global fixed settings
+    N = 50
+    dt = 0.01
+
+    # -------------------------
+    # 3.1 Attractor memory (noise_std=0.4 summary)
+    # -------------------------
+    set_seed(0)
+    P = 3
+    patterns = np.random.choice([-1, 1], size=(P, N)).astype(float)
+    W_hop = build_hopfield_W(patterns)
+
+    # Dissipative params for attractor/sequence
+    params_diss_hop = CT2RNNParams(N=N, dt=dt, gamma_q=0.2, gamma_p=0.2)
+    params_rev_hop  = CT2RNNParams(N=N, dt=dt, gamma_q=0.0, gamma_p=0.0)
+
+    n_trials = 50
+    noise_std_init = 0.4
+
+    # fixed cue distribution (cycle cues)
+    acc_diss = np.zeros(n_trials, dtype=int)
+    acc_rev  = np.zeros(n_trials, dtype=int)
+
+    for i in range(n_trials):
+        cue = i % P
+        acc_diss[i] = attractor_memory_trial(patterns, W_hop, params_diss_hop, cue, noise_std_init, seed=10_000 + i)
+        acc_rev[i]  = attractor_memory_trial(patterns, W_hop, params_rev_hop,  cue, noise_std_init, seed=20_000 + i)
+
+    p_fisher = fisher_exact_from_binary(acc_diss, acc_rev)
+    ci_diss = bootstrap_ci(acc_diss.astype(float), seed=1)
+    ci_rev  = bootstrap_ci(acc_rev.astype(float), seed=2)
+
+    # -------------------------
+    # 3.2 Sequence tracking (noise_std=0.4 summary)
+    # -------------------------
+    noise_std_ongoing_seq = 0.4
+    seq_diss = np.zeros(n_trials, dtype=float)
+    seq_rev  = np.zeros(n_trials, dtype=float)
+
+    for i in range(n_trials):
+        seq_diss[i] = sequence_tracking_trial(patterns, W_hop, params_diss_hop, noise_std_ongoing_seq, seed=30_000 + i)
+        seq_rev[i]  = sequence_tracking_trial(patterns, W_hop, params_rev_hop,  noise_std_ongoing_seq, seed=40_000 + i)
+
+    p_seq = welch_ttest(seq_diss, seq_rev)
+    d_seq = cohens_d(seq_diss, seq_rev)
+    ci_seq_diss = bootstrap_ci(seq_diss, seed=3)
+    ci_seq_rev  = bootstrap_ci(seq_rev,  seed=4)
+
+    # -------------------------
+    # 3.3 Input-output mapping (Noise_std=0.8)
+    # -------------------------
+    # Reservoir W, input embedder B
+    W_res = build_reservoir_W(N=N, g=0.9, seed=123)
+    B = build_input_B(N=N, d_in=2, seed=456)
+
+    # Dissipative params for input-output
+    params_diss_io = CT2RNNParams(N=N, dt=dt, gamma_q=0.3, gamma_p=0.3)
+    params_rev_io  = CT2RNNParams(N=N, dt=dt, gamma_q=0.0, gamma_p=0.0)
+
+    # Fixed train/test points (you can set to your exact fixed 20 test points by hard-coding X_test here)
+    n_train = 200
+    n_test = 20
+    X_train, X_test = input_output_generate_points(n_train=n_train, n_test=n_test, seed=999)
+
+    T_io = 5.0
+    lam = 1e-3
+
+    # Train readout once in dissipative regime without noise
+    C = input_output_train_readout_ct2rnn(W_res, B, params_diss_io, X_train, T=T_io, lam=lam, seed_base=50_000)
+
+    noise_std_ongoing_io = 0.8
+
+    mse_diss = np.zeros(n_trials, dtype=float)
+    mse_rev  = np.zeros(n_trials, dtype=float)
+
+    for i in range(n_trials):
+        mse_diss[i] = input_output_eval_trial_ct2rnn(W_res, B, C, params_diss_io, X_test, T=T_io,
+                                                     noise_std_ongoing=noise_std_ongoing_io, seed=60_000 + i)
+        mse_rev[i]  = input_output_eval_trial_ct2rnn(W_res, B, C, params_rev_io,  X_test, T=T_io,
+                                                     noise_std_ongoing=noise_std_ongoing_io, seed=70_000 + i)
+
+    p_io = welch_ttest(mse_diss, mse_rev)
+    d_io = cohens_d(mse_diss, mse_rev)
+    ci_mse_diss = bootstrap_ci(mse_diss, seed=5)
+    ci_mse_rev  = bootstrap_ci(mse_rev,  seed=6)
+
+    # -------------------------
+    # ESN / Leaky baselines for same target function, using an input time series formulation
+    # Here we construct a time series by presenting the 2D inputs as a sequence and predicting f(x_t).
+    # This is a standard way to define an equivalent baseline for a static mapping under sequential processing.
+    # -------------------------
+    # Build a time series from X_train then X_test (repeat for stability)
+    # You can increase repeats if needed; keep identical for all baselines.
+    repeats = 25
+    X_seq = np.vstack([X_train, X_test])
+    y_seq = target_f(X_seq)
+    # Use a scalar input u_t by projecting 2D -> 1D for ESN/Leaky (fixed projection)
+    # If you want strict 2D input, extend Win to 2 columns and modify step functions.
+    proj = np.array([1.0, 0.0])
+    u_seq = (X_seq @ proj).astype(float)
+
+    # Add measurement noise to inputs to match noise_std notion (ongoing noise).
+    # Here, we inject noise into the scalar input u_t; alternative is state noise.
+    # Keep protocol identical across ESN/Leaky trials.
+    washout = 20
+
+    def make_noisy_u(seed):
+        rng = np.random.default_rng(seed)
+        return u_seq + rng.normal(0.0, noise_std_ongoing_io, size=u_seq.shape)
+
+    # ESN connectivity
+    rng_esn = np.random.default_rng(222)
+    W_esn = rng_esn.normal(0.0, 1.0 / math.sqrt(N), size=(N, N))
+    # scale spectral radius ~ 0.9 (common ESN setting)
+    eigs = np.linalg.eigvals(W_esn)
+    sr = max(abs(eigs))
+    if sr > 1e-12:
+        W_esn = W_esn * (0.9 / sr)
+    Win_esn = rng_esn.normal(0.0, 1.0, size=(N, 1))
+
+    # Leaky uses same W and Win structure
+    W_leaky = W_esn.copy()
+    Win_leaky = Win_esn.copy()
+    leak = 0.2
+
+    mse_esn = np.zeros(n_trials, dtype=float)
+    mse_leaky = np.zeros(n_trials, dtype=float)
+
+    for i in range(n_trials):
+        u_noisy = make_noisy_u(80_000 + i)
+        # Train on first part (X_train) and test on last part (X_test)
+        split = len(X_train)
+        C_esn = esn_train_readout(W_esn, Win_esn, u_noisy[:split], y_seq[:split], washout=washout, lam=lam)
+        mse_esn[i] = esn_eval_mse(W_esn, Win_esn, C_esn, u_noisy[split:], y_seq[split:], washout=0)
+
+        C_lk = leaky_train_readout(W_leaky, Win_leaky, u_noisy[:split], y_seq[:split], washout=washout, leak=leak, lam=lam)
+        mse_leaky[i] = leaky_eval_mse(W_leaky, Win_leaky, C_lk, u_noisy[split:], y_seq[split:], washout=0, leak=leak)
+
+    ci_mse_esn = bootstrap_ci(mse_esn, seed=7)
+    ci_mse_leaky = bootstrap_ci(mse_leaky, seed=8)
+
+    # Baseline comparison p-values with Holm–Bonferroni
+    p_diss_vs_esn = welch_ttest(mse_diss, mse_esn)
+    p_diss_vs_leaky = welch_ttest(mse_diss, mse_leaky)
+    p_adj = holm_bonferroni([p_diss_vs_esn, p_diss_vs_leaky])
+
+    # -------------------------
+    # 3.4 Internal dynamics under Noise_std=0.8 (same input-output condition)
+    # We record r(t) trajectories for each trial, restricted to final 20%.
+    # -------------------------
+    T_record = T_io
+    steps = int(round(T_record / dt)) + 1
+    start_idx = int(round(0.8 * steps))
+
+    def record_r_trials(params: CT2RNNParams, seed_base: int) -> np.ndarray:
+        r_trials = np.zeros((n_trials, steps, N), dtype=float)
+        for i in range(n_trials):
+            rng = np.random.default_rng(seed_base + i)
+            # choose one fixed test input for internal dynamics (or average over all; keep fixed for reproducibility)
+            x = X_test[0]
+            def I_of_t(t, x=x):
+                return B @ x
+            q0 = np.zeros(N, dtype=float)
+            out = simulate_ct2rnn(W_res, I_of_t, T=T_record, params=params, q0=q0,
+                                 sigma_ongoing=noise_std_ongoing_io,
+                                 seed=int(rng.integers(0, 2**31-1)),
+                                 record=True)
+            r_trials[i] = out["r_traj"]
+        return r_trials
+
+    r_trials_diss = record_r_trials(params_diss_io, seed_base=90_000)
+    r_trials_rev  = record_r_trials(params_rev_io,  seed_base=100_000)
+
+    r_diss_tail = r_trials_diss[:, start_idx:, :]
+    r_rev_tail  = r_trials_rev[:,  start_idx:, :]
+
+    var_diss = trial_to_trial_variance(r_diss_tail)
+    var_rev  = trial_to_trial_variance(r_rev_tail)
+
+    mean_ac_diss, tau_diss = mean_autocorr_1e_time(r_diss_tail, dt=dt)
+    mean_ac_rev,  tau_rev  = mean_autocorr_1e_time(r_rev_tail,  dt=dt)
+
+    # -------------------------
+    # Print summary (numbers)
+    # -------------------------
+    print("Attractor memory (noise_std=0.4)")
+    print("Diss acc mean:", acc_diss.mean(), "95% CI:", ci_diss, "n=", n_trials)
+    print("Rev  acc mean:", acc_rev.mean(),  "95% CI:", ci_rev,  "n=", n_trials)
+    print("Fisher p:", p_fisher)
+    print()
+
+    print("Sequence tracking (noise_std=0.4)")
+    print("Diss mean:", seq_diss.mean(), "95% CI:", ci_seq_diss)
+    print("Rev  mean:", seq_rev.mean(),  "95% CI:", ci_seq_rev)
+    print("Welch p:", p_seq, "Cohen's d:", d_seq)
+    print()
+
+    print("Input-output mapping (noise_std=0.8)")
+    print("Diss MSE mean:", mse_diss.mean(), "95% CI:", ci_mse_diss)
+    print("Rev  MSE mean:", mse_rev.mean(),  "95% CI:", ci_mse_rev)
+    print("Welch p:", p_io, "Cohen's d:", d_io)
+    print("ESN  mean/std:", mse_esn.mean(), mse_esn.std(ddof=1), "95% CI:", ci_mse_esn)
+    print("Leaky mean/std:", mse_leaky.mean(), mse_leaky.std(ddof=1), "95% CI:", ci_mse_leaky)
+    print("Diss vs ESN p:", p_diss_vs_esn, "adj:", p_adj[0])
+    print("Diss vs Leaky p:", p_diss_vs_leaky, "adj:", p_adj[1])
+    print()
+
+    print("Internal dynamics (noise_std=0.8)")
+    print("Trial-to-trial variance: Diss", var_diss, "Rev", var_rev)
+    print("Autocorr 1/e time (s):   Diss", tau_diss, "Rev", tau_rev)
+    print()
+
+    # -------------------------
+    # Figures
+    # -------------------------
+
+    # Figure 1: MSE distributions across 4 models (log scale)
+    plt.figure(figsize=(6.5, 4.5))
+    data = [mse_diss, mse_rev, mse_esn, mse_leaky]
+    labels = ["Dissipative", "Reversible", "ESN", "Leaky RNN"]
+
+    bp = plt.boxplot(data, labels=labels, patch_artist=True, showfliers=False)
+    colors = ['#1f77b4', '#7f7f7f', '#ffbb78', '#ff9896']
+    for patch, c in zip(bp['boxes'], colors):
+        patch.set_facecolor(c)
+        patch.set_alpha(0.7)
+
+    for i, d in enumerate(data):
+        x = np.random.normal(i + 1, 0.04, size=len(d))
+        plt.scatter(x, d, s=12, color='black', alpha=0.45)
+
+    plt.yscale("log")
+    plt.ylabel("Test mean squared error")
+    plt.title("Nonlinear input–output mapping under noise (Noise_std = 0.8)")
+    plt.tight_layout()
+    plt.show()
+
+    # Figure 2: internal variability (means)
+    plt.figure(figsize=(4, 4))
+    plt.bar(["Dissipative", "Reversible"], [var_diss, var_rev],
+            color=['#1f77b4', '#7f7f7f'], alpha=0.8)
+    plt.ylabel("Trial-to-trial variance")
+    plt.title("Internal variability under noise")
+    plt.tight_layout()
+    plt.show()
+
+    # Figure 3: mean autocorrelation curves with 1/e and tau markers
+    lags = np.arange(len(mean_ac_diss)) * dt
+    plt.figure(figsize=(4.5, 4))
+    plt.plot(lags, mean_ac_diss, label="Dissipative", color="#1f77b4", linewidth=2)
+    plt.plot(lags, mean_ac_rev,  label="Reversible",  color="#7f7f7f", linewidth=2)
+    plt.axhline(1.0 / math.e, linestyle="--", color="black", linewidth=1)
+    plt.axvline(tau_diss, color="#1f77b4", linestyle=":", linewidth=1)
+    plt.axvline(tau_rev,  color="#7f7f7f", linestyle=":", linewidth=1)
+    plt.xlabel("Lag (s)")
+    plt.ylabel("Autocorrelation")
+    plt.title("Temporal stability of internal activity")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    main()
